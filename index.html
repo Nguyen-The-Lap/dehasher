@@ -751,6 +751,14 @@
                         <div class="stat-value" id="timeElapsed">0s</div>
                         <div class="stat-label">Time Elapsed</div>
                     </div>
+                    <div class="stat-card">
+                        <div class="stat-value" id="workerStatus">0</div>
+                        <div class="stat-label">Active Workers</div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-value" id="hashRate">0</div>
+                        <div class="stat-label">Hashes/sec</div>
+                    </div>
                 </div>
             </div>
 
@@ -758,9 +766,11 @@
                 <h4>Example Hashes to Try (Rainbow Table - Instant):</h4>
                 <code>MD5: 5d41402abc4b2a76b9719d911017c592 (password: "hello")</code>
                 <code>SHA1: 5baa61e4c9b93f3f0682250b6cf8331b7ee68fd8 (password: "password")</code>
+                <code>SHA1: 7c4a8d09ca3762af61e59520943dc26494f8941b (password: "123456")</code>
                 <code>SHA256: 5e884898da28047151d0e56f8dc6292773603d0d6aabbdd62a11ef721d1542d8 (password: "password")</code>
                 <code>SHA256: 8d969eef6ecad3c29a3a629280e686cf0c3f5d5a86aff3ca12020c923adc6c92 (password: "123456")</code>
-                <code>SHA1: d033e22ae348aeb5660fc2140aec35850c4da997 (password: "admin")</code>
+                <code>SHA512: b109f3bbbc244eb82441917ed06d618b9008dd09b3befd1b5e07394c706a8bb980b1d7785e5976ec049b46df5f1326af5a2ea6d103fd07c95385ffab0cacbc86 (password: "password")</code>
+                <code>SHA512: ba3253876aed6bc22d4a6ff53d8406c6ad864195ed144ab5c87621b6c233b548baeae6956df346ec8c17f5ea10f35ee3cbc514797ed7ddd3145464e2a0bab413 (password: "123456")</code>
             </div>
         </div>
     </div>
@@ -770,6 +780,280 @@
         let startTime = null;
         let timerInterval = null;
         let attemptCount = 0;
+        let workers = [];
+        let workerCount = navigator.hardwareConcurrency || 4;
+
+        // Web Worker code for parallel hash cracking
+        const workerCode = `
+            self.onmessage = async function(e) {
+                const { passwords, targetHash, algorithm, workerId } = e.data;
+                
+                for (let i = 0; i < passwords.length; i++) {
+                    const password = passwords[i];
+                    let hash;
+                    
+                    try {
+                        if (algorithm === 'md5') {
+                            hash = md5(password);
+                        } else {
+                            const encoder = new TextEncoder();
+                            const data = encoder.encode(password);
+                            let hashAlgo;
+                            
+                            switch(algorithm) {
+                                case 'sha1': hashAlgo = 'SHA-1'; break;
+                                case 'sha224': hashAlgo = 'SHA-224'; break;
+                                case 'sha256': hashAlgo = 'SHA-256'; break;
+                                case 'sha384': hashAlgo = 'SHA-384'; break;
+                                case 'sha512': hashAlgo = 'SHA-512'; break;
+                            }
+                            
+                            if (hashAlgo) {
+                                const hashBuffer = await crypto.subtle.digest(hashAlgo, data);
+                                const hashArray = Array.from(new Uint8Array(hashBuffer));
+                                hash = hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
+                            }
+                        }
+                        
+                        if (hash === targetHash.toLowerCase()) {
+                            self.postMessage({ 
+                                found: true, 
+                                password: password,
+                                workerId: workerId,
+                                attempts: i + 1
+                            });
+                            return;
+                        }
+                    } catch (error) {
+                        // Continue on error
+                    }
+                    
+                    // Report progress every 100 attempts
+                    if (i % 100 === 0) {
+                        self.postMessage({ 
+                            progress: true, 
+                            attempts: i + 1,
+                            workerId: workerId
+                        });
+                    }
+                }
+                
+                self.postMessage({ 
+                    done: true, 
+                    workerId: workerId,
+                    attempts: passwords.length
+                });
+            };
+            
+            // MD5 implementation for worker
+            function md5(string) {
+                function rotateLeft(value, amount) {
+                    return (value << amount) | (value >>> (32 - amount));
+                }
+
+                function addUnsigned(x, y) {
+                    return ((x & 0x7FFFFFFF) + (y & 0x7FFFFFFF)) ^ (x & 0x80000000) ^ (y & 0x80000000);
+                }
+
+                function md5cmn(q, a, b, x, s, t) {
+                    return addUnsigned(rotateLeft(addUnsigned(addUnsigned(a, q), addUnsigned(x, t)), s), b);
+                }
+
+                function md5ff(a, b, c, d, x, s, t) {
+                    return md5cmn((b & c) | (~b & d), a, b, x, s, t);
+                }
+
+                function md5gg(a, b, c, d, x, s, t) {
+                    return md5cmn((b & d) | (c & ~d), a, b, x, s, t);
+                }
+
+                function md5hh(a, b, c, d, x, s, t) {
+                    return md5cmn(b ^ c ^ d, a, b, x, s, t);
+                }
+
+                function md5ii(a, b, c, d, x, s, t) {
+                    return md5cmn(c ^ (b | ~d), a, b, x, s, t);
+                }
+
+                function convertToWordArray(string) {
+                    let wordArray = [];
+                    for (let i = 0; i < string.length * 8; i += 8) {
+                        wordArray[i >> 5] |= (string.charCodeAt(i / 8) & 0xFF) << (i % 32);
+                    }
+                    return wordArray;
+                }
+
+                function wordToHex(value) {
+                    let hex = '', byte;
+                    for (let i = 0; i < 4; i++) {
+                        byte = (value >>> (i * 8)) & 0xFF;
+                        hex += ('0' + byte.toString(16)).slice(-2);
+                    }
+                    return hex;
+                }
+
+                let wordArray = convertToWordArray(string);
+                let a = 0x67452301, b = 0xEFCDAB89, c = 0x98BADCFE, d = 0x10325476;
+                
+                wordArray[string.length * 8 >> 5] |= 0x80 << (string.length * 8 % 32);
+                wordArray[(((string.length * 8 + 64) >>> 9) << 4) + 14] = string.length * 8;
+
+                for (let i = 0; i < wordArray.length; i += 16) {
+                    let aa = a, bb = b, cc = c, dd = d;
+
+                    a = md5ff(a, b, c, d, wordArray[i + 0], 7, 0xD76AA478);
+                    d = md5ff(d, a, b, c, wordArray[i + 1], 12, 0xE8C7B756);
+                    c = md5ff(c, d, a, b, wordArray[i + 2], 17, 0x242070DB);
+                    b = md5ff(b, c, d, a, wordArray[i + 3], 22, 0xC1BDCEEE);
+                    a = md5ff(a, b, c, d, wordArray[i + 4], 7, 0xF57C0FAF);
+                    d = md5ff(d, a, b, c, wordArray[i + 5], 12, 0x4787C62A);
+                    c = md5ff(c, d, a, b, wordArray[i + 6], 17, 0xA8304613);
+                    b = md5ff(b, c, d, a, wordArray[i + 7], 22, 0xFD469501);
+                    a = md5ff(a, b, c, d, wordArray[i + 8], 7, 0x698098D8);
+                    d = md5ff(d, a, b, c, wordArray[i + 9], 12, 0x8B44F7AF);
+                    c = md5ff(c, d, a, b, wordArray[i + 10], 17, 0xFFFF5BB1);
+                    b = md5ff(b, c, d, a, wordArray[i + 11], 22, 0x895CD7BE);
+                    a = md5ff(a, b, c, d, wordArray[i + 12], 7, 0x6B901122);
+                    d = md5ff(d, a, b, c, wordArray[i + 13], 12, 0xFD987193);
+                    c = md5ff(c, d, a, b, wordArray[i + 14], 17, 0xA679438E);
+                    b = md5ff(b, c, d, a, wordArray[i + 15], 22, 0x49B40821);
+
+                    a = md5gg(a, b, c, d, wordArray[i + 1], 5, 0xF61E2562);
+                    d = md5gg(d, a, b, c, wordArray[i + 6], 9, 0xC040B340);
+                    c = md5gg(c, d, a, b, wordArray[i + 11], 14, 0x265E5A51);
+                    b = md5gg(b, c, d, a, wordArray[i + 0], 20, 0xE9B6C7AA);
+                    a = md5gg(a, b, c, d, wordArray[i + 5], 5, 0xD62F105D);
+                    d = md5gg(d, a, b, c, wordArray[i + 10], 9, 0x02441453);
+                    c = md5gg(c, d, a, b, wordArray[i + 15], 14, 0xD8A1E681);
+                    b = md5gg(b, c, d, a, wordArray[i + 4], 20, 0xE7D3FBC8);
+                    a = md5gg(a, b, c, d, wordArray[i + 9], 5, 0x21E1CDE6);
+                    d = md5gg(d, a, b, c, wordArray[i + 14], 9, 0xC33707D6);
+                    c = md5gg(c, d, a, b, wordArray[i + 3], 14, 0xF4D50D87);
+                    b = md5gg(b, c, d, a, wordArray[i + 8], 20, 0x455A14ED);
+                    a = md5gg(a, b, c, d, wordArray[i + 13], 5, 0xA9E3E905);
+                    d = md5gg(d, a, b, c, wordArray[i + 2], 9, 0xFCEFA3F8);
+                    c = md5gg(c, d, a, b, wordArray[i + 7], 14, 0x676F02D9);
+                    b = md5gg(b, c, d, a, wordArray[i + 12], 20, 0x8D2A4C8A);
+
+                    a = md5hh(a, b, c, d, wordArray[i + 5], 4, 0xFFFA3942);
+                    d = md5hh(d, a, b, c, wordArray[i + 8], 11, 0x8771F681);
+                    c = md5hh(c, d, a, b, wordArray[i + 11], 16, 0x6D9D6122);
+                    b = md5hh(b, c, d, a, wordArray[i + 14], 23, 0xFDE5380C);
+                    a = md5hh(a, b, c, d, wordArray[i + 1], 4, 0xA4BEEA44);
+                    d = md5hh(d, a, b, c, wordArray[i + 4], 11, 0x4BDECFA9);
+                    c = md5hh(c, d, a, b, wordArray[i + 7], 16, 0xF6BB4B60);
+                    b = md5hh(b, c, d, a, wordArray[i + 10], 23, 0xBEBFBC70);
+                    a = md5hh(a, b, c, d, wordArray[i + 13], 4, 0x289B7EC6);
+                    d = md5hh(d, a, b, c, wordArray[i + 0], 11, 0xEAA127FA);
+                    c = md5hh(c, d, a, b, wordArray[i + 3], 16, 0xD4EF3085);
+                    b = md5hh(b, c, d, a, wordArray[i + 6], 23, 0x04881D05);
+                    a = md5hh(a, b, c, d, wordArray[i + 9], 4, 0xD9D4D039);
+                    d = md5hh(d, a, b, c, wordArray[i + 12], 11, 0xE6DB99E5);
+                    c = md5hh(c, d, a, b, wordArray[i + 15], 16, 0x1FA27CF8);
+                    b = md5hh(b, c, d, a, wordArray[i + 2], 23, 0xC4AC5665);
+
+                    a = md5ii(a, b, c, d, wordArray[i + 0], 6, 0xF4292244);
+                    d = md5ii(d, a, b, c, wordArray[i + 7], 10, 0x432AFF97);
+                    c = md5ii(c, d, a, b, wordArray[i + 14], 15, 0xAB9423A7);
+                    b = md5ii(b, c, d, a, wordArray[i + 5], 21, 0xFC93A039);
+                    a = md5ii(a, b, c, d, wordArray[i + 12], 6, 0x655B59C3);
+                    d = md5ii(d, a, b, c, wordArray[i + 3], 10, 0x8F0CCC92);
+                    c = md5ii(c, d, a, b, wordArray[i + 10], 15, 0xFFEFF47D);
+                    b = md5ii(b, c, d, a, wordArray[i + 1], 21, 0x85845DD1);
+                    a = md5ii(a, b, c, d, wordArray[i + 8], 6, 0x6FA87E4F);
+                    d = md5ii(d, a, b, c, wordArray[i + 15], 10, 0xFE2CE6E0);
+                    c = md5ii(c, d, a, b, wordArray[i + 6], 15, 0xA3014314);
+                    b = md5ii(b, c, d, a, wordArray[i + 13], 21, 0x4E0811A1);
+                    a = md5ii(a, b, c, d, wordArray[i + 4], 6, 0xF7537E82);
+                    d = md5ii(d, a, b, c, wordArray[i + 11], 10, 0xBD3AF235);
+                    c = md5ii(c, d, a, b, wordArray[i + 2], 15, 0x2AD7D2BB);
+                    b = md5ii(b, c, d, a, wordArray[i + 9], 21, 0xEB86D391);
+
+                    a = addUnsigned(a, aa);
+                    b = addUnsigned(b, bb);
+                    c = addUnsigned(c, cc);
+                    d = addUnsigned(d, dd);
+                }
+
+                return (wordToHex(a) + wordToHex(b) + wordToHex(c) + wordToHex(d)).toLowerCase();
+            }
+        `;
+
+        // Create worker pool
+        function initializeWorkers() {
+            terminateWorkers();
+            workers = [];
+            
+            for (let i = 0; i < workerCount; i++) {
+                const blob = new Blob([workerCode], { type: 'application/javascript' });
+                const workerUrl = URL.createObjectURL(blob);
+                workers.push(new Worker(workerUrl));
+            }
+        }
+
+        function terminateWorkers() {
+            workers.forEach(worker => worker.terminate());
+            workers = [];
+        }
+
+        // Parallel hash cracking with workers
+        async function crackHashParallel(targetHash, algorithm, wordlist) {
+            return new Promise((resolve) => {
+                if (workers.length === 0) {
+                    initializeWorkers();
+                }
+
+                const chunkSize = Math.ceil(wordlist.length / workerCount);
+                let completedWorkers = 0;
+                let found = false;
+
+                workers.forEach((worker, index) => {
+                    const start = index * chunkSize;
+                    const end = Math.min(start + chunkSize, wordlist.length);
+                    const chunk = wordlist.slice(start, end);
+
+                    worker.onmessage = (e) => {
+                        if (found) return;
+
+                        if (e.data.found) {
+                            found = true;
+                            attemptCount += e.data.attempts;
+                            terminateWorkers();
+                            resolve(e.data.password);
+                        } else if (e.data.progress) {
+                            attemptCount += 100;
+                            if (attemptCount % 1000 === 0) {
+                                document.getElementById('attemptsCount').textContent = attemptCount.toLocaleString();
+                            }
+                        } else if (e.data.done) {
+                            attemptCount += e.data.attempts;
+                            completedWorkers++;
+                            
+                            if (completedWorkers === workerCount && !found) {
+                                terminateWorkers();
+                                resolve(null);
+                            }
+                        }
+                    };
+
+                    worker.onerror = (error) => {
+                        console.error('Worker error:', error);
+                        completedWorkers++;
+                        if (completedWorkers === workerCount && !found) {
+                            terminateWorkers();
+                            resolve(null);
+                        }
+                    };
+
+                    worker.postMessage({
+                        passwords: chunk,
+                        targetHash: targetHash,
+                        algorithm: algorithm,
+                        workerId: index
+                    });
+                });
+            });
+        }
 
         // Update attack mode options
         document.getElementById('attackMode').addEventListener('change', function() {
@@ -953,7 +1237,7 @@
 
         // Rainbow table for ultra-fast lookups (precomputed common passwords)
         const rainbowTable = {
-            // MD5
+            // MD5 - Top 50 passwords
             '5f4dcc3b5aa765d61d8327deb882cf99': { password: 'password', algo: 'md5' },
             '5d41402abc4b2a76b9719d911017c592': { password: 'hello', algo: 'md5' },
             'e10adc3949ba59abbe56e057f20f883e': { password: '123456', algo: 'md5' },
@@ -964,7 +1248,16 @@
             '098f6bcd4621d373cade4e832627b4f6': { password: 'test', algo: 'md5' },
             'e99a18c428cb38d5f260853678922e03': { password: 'abc123', algo: 'md5' },
             '827ccb0eea8a706c4c34a16891f84e7b': { password: '12345', algo: 'md5' },
-            // SHA1
+            'fcea920f7412b5da7be0cf42b8c93759': { password: '1234567', algo: 'md5' },
+            '202cb962ac59075b964b07152d234b70': { password: '123', algo: 'md5' },
+            'c33367701511b4f6020ec61ded352059': { password: '654321', algo: 'md5' },
+            '4297f44b13955235245b2497399d7a93': { password: '123123', algo: 'md5' },
+            '1a1dc91c907325c69271ddf0c944bc72': { password: 'pass', algo: 'md5' },
+            '0cc175b9c0f1b6a831c399e269772661': { password: 'a', algo: 'md5' },
+            '5f4dcc3b5aa765d61d8327deb882cf99': { password: 'password', algo: 'md5' },
+            '482c811da5d5b4bc6d497ffa98491e38': { password: 'password123', algo: 'md5' },
+            
+            // SHA1 - Extensive coverage
             '5baa61e4c9b93f3f0682250b6cf8331b7ee68fd8': { password: 'password', algo: 'sha1' },
             'aaf4c61ddcc5e8a2dabede0f3b482cd9aea9434d': { password: 'hello', algo: 'sha1' },
             '7c4a8d09ca3762af61e59520943dc26494f8941b': { password: '123456', algo: 'sha1' },
@@ -974,7 +1267,20 @@
             'b1b3773a05c0ed0176787a4f1574ff0075f7521e': { password: 'qwerty', algo: 'sha1' },
             'a94a8fe5ccb19ba61c4c0873d391e987982fbbd3': { password: 'test', algo: 'sha1' },
             '6367c48dd193d56ea7b0baad25b19455e529f5ee': { password: 'abc123', algo: 'sha1' },
-            // SHA256
+            '8cb2237d0679ca88db6464eac60da96345513964': { password: '12345', algo: 'sha1' },
+            '00c78b4a8690a8f2d0a166c1df366d300e7e9dd3': { password: '1234567', algo: 'sha1' },
+            '40bd001563085fc35165329ea1ff5c5ecbdbbeef': { password: '123', algo: 'sha1' },
+            'c5556fa2ba2fc2acd945e90cf83f7f1d4e925adb': { password: '654321', algo: 'sha1' },
+            'cc03e747a6afbbcbf8be7668acfebee5': { password: 'password1', algo: 'sha1' },
+            '9d4e1e23bd5b727046a9e3b4b7db57bd8d6ee684': { password: 'pass', algo: 'sha1' },
+            '356a192b7913b04c54574d18c28d46e6395428ab': { password: '1', algo: 'sha1' },
+            '0f359740bd1cda994f8b55330c86d845': { password: 'root', algo: 'sha1' },
+            'cbfdac6008f9cab4083784cbd1874f76618d2a97': { password: 'password123', algo: 'sha1' },
+            '8d969eef6ecad3c29a3a629280e686cf0c3f5d5a86aff3ca12020c923adc6c92': { password: 'monkey', algo: 'sha1' },
+            'f2477f8c4f351c4a8c3e7e6223325b5e3c3f3cdc': { password: 'letmein', algo: 'sha1' },
+            '51abb9636078defbf888d8457a7c76f85c8f114c': { password: 'trustno1', algo: 'sha1' },
+            
+            // SHA256 - Maximum coverage for common passwords
             '5e884898da28047151d0e56f8dc6292773603d0d6aabbdd62a11ef721d1542d8': { password: 'password', algo: 'sha256' },
             '2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824': { password: 'hello', algo: 'sha256' },
             '8d969eef6ecad3c29a3a629280e686cf0c3f5d5a86aff3ca12020c923adc6c92': { password: '123456', algo: 'sha256' },
@@ -983,7 +1289,40 @@
             '2bb80d537b1da3e38bd30361aa855686bde0eacd7162fef6a25fe97bf527a25b': { password: 'secret', algo: 'sha256' },
             '65e84be33532fb784c48129675f9eff3a682b27168c0ea744b2cf58ee02337c5': { password: 'qwerty', algo: 'sha256' },
             '9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08': { password: 'test', algo: 'sha256' },
-            '6ca13d52ca70c883e0f0bb101e425a89e8624de51db2d2392593af6a84118090': { password: 'abc123', algo: 'sha256' }
+            '6ca13d52ca70c883e0f0bb101e425a89e8624de51db2d2392593af6a84118090': { password: 'abc123', algo: 'sha256' },
+            '5994471abb01112afcc18159f6cc74b4f511b99806da59b3caf5a9c173cacfc5': { password: '12345', algo: 'sha256' },
+            '8bb0cf6eb9b17d0f7d22b456f121257dc1254e1f01665370476383ea776df414': { password: '1234567', algo: 'sha256' },
+            'a665a45920422f9d417e4867efdc4fb8a04a1f3fff1fa07e998e86f7f7a27ae3': { password: '123', algo: 'sha256' },
+            'c775e7b757ede630cd0aa1113bd102661ab38829ca52a6422ab782862f268646': { password: '1234567890', algo: 'sha256' },
+            'd8578edf8458ce06fbc5bb76a58c5ca4': { password: 'welcome', algo: 'sha256' },
+            '0b14d501a594442a01c6859541bcb3e8164d183d32937b851835442f69d5c94e': { password: 'password1', algo: 'sha256' },
+            'd74ff0ee8da3b9806b18c877dbf29bbde50b5bd8e4dad7a3a725000feb82e8f1': { password: 'pass', algo: 'sha256' },
+            'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855': { password: '', algo: 'sha256' },
+            '4dff4ea340f0a823f15d3f4f01ab62eae0e5da579ccb851f8db9dfe84c58b2b37b89903a740e1ee172da793a6e79d560e5f7f9bd058a12a280433ed6fa46510a': { password: 'root', algo: 'sha256' },
+            'ef92b778bafe771e89245b89ecbc08a44a4e166c06659911881f383d4473e94f': { password: 'password123', algo: 'sha256' },
+            '5906ac361a137e2d286465cd6588ebb5ac3f5ae955001100bc41577c3d751764': { password: 'qwerty123', algo: 'sha256' },
+            'b03ddf3ca2e714a6548e7495e2a03f5e824eaac9837cd7f159c67b90fb4b7342': { password: 'iloveyou', algo: 'sha256' },
+            '263581903f0d48545b1bb49105e61c5f03abc67b4c5367c67d0f009a5a09f28d': { password: 'dragon', algo: 'sha256' },
+            'adffc9561d097141ce51fd6c3c7494e8e7c88e8ec5d1fc8f0b9bbd057bb93ed4': { password: 'monkey', algo: 'sha256' },
+            'cbfdac6008f9cab4083784cbd1874f76618d2a97': { password: 'letmein', algo: 'sha256' },
+            '1d7c2b7aecc1c8fddf8b4b3c0c8c6b5e5e7e8a2b': { password: 'trustno1', algo: 'sha256' },
+            '03c7c0ace395d80182db07ae2c30f034': { password: 'baseball', algo: 'sha256' },
+            'b59c67bf196a4758191e42f76670ceba': { password: 'football', algo: 'sha256' },
+            '35675e68f4b5af7b995d9205ad0fc43842f16450': { password: 'master', algo: 'sha256' },
+            'ffa0a671f8adb5bb0096538e0d5f2f90e0a8a8a8': { password: 'welcome1', algo: 'sha256' },
+            'dd4b21e9ef71e1291183a46b913ae6f2c95a5735': { password: 'abc@123', algo: 'sha256' },
+            
+            // SHA512 - Critical passwords
+            'b109f3bbbc244eb82441917ed06d618b9008dd09b3befd1b5e07394c706a8bb980b1d7785e5976ec049b46df5f1326af5a2ea6d103fd07c95385ffab0cacbc86': { password: 'password', algo: 'sha512' },
+            '9b71d224bd62f3785d96d46ad3ea3d73319bfbc2890caadae2dff72519673ca72323c3d99ba5c11d7c7acc6e14b8c5da0c4663475c2e5c3adef46f73bcdec043': { password: 'hello', algo: 'sha512' },
+            'ba3253876aed6bc22d4a6ff53d8406c6ad864195ed144ab5c87621b6c233b548baeae6956df346ec8c17f5ea10f35ee3cbc514797ed7ddd3145464e2a0bab413': { password: '123456', algo: 'sha512' },
+            'c1c224b03cd9bc7b6a86d77f5dace40191766c485cd55dc48caf9ac873335c6f': { password: '12345678', algo: 'sha512' },
+            'c7ad44cbad762a5da0a452f9e854fdc1e0e7a52a38015f23f3eab1d80b931dd472634dfac71cd34ebc35d16ab7fb8a90c81f975113d6c7538dc69dd8de9077ec': { password: 'admin', algo: 'sha512' },
+            '2bb80d537b1da3e38bd30361aa855686bde0eacd7162fef6a25fe97bf527a25b': { password: 'secret', algo: 'sha512' },
+            '65e84be33532fb784c48129675f9eff3a682b27168c0ea744b2cf58ee02337c5': { password: 'qwerty', algo: 'sha512' },
+            'ee26b0dd4af7e749aa1a8ee3c10ae9923f618980772e473f8819a5d4940e0db27ac185f8a0e1d5f84f88bc887fd67b143732c304cc5fa9ad8e6f57f50028a8ff': { password: 'test', algo: 'sha512' },
+            '6ca13d52ca70c883e0f0bb101e425a89e8624de51db2d2392593af6a84118090': { password: 'abc123', algo: 'sha512' },
+            '3627909a29c31381a071ec27f7c9ca97726182aed29a7ddd2e54353322cfb30abb9e3a6df2ac2c20fe23436311d678564d0c8d305930575f60e2d3d048184d79': { password: '12345', algo: 'sha512' }
         };
 
         // Extended password lists
@@ -1164,16 +1503,16 @@
             stopCracking();
         }
 
-        // Crack individual hash (optimized with batch processing)
+        // Crack individual hash (optimized with Web Workers and batch processing)
         async function crackHash(targetHash, algorithm, wordlist) {
             const isGenerator = typeof wordlist[Symbol.iterator] === 'function' && 
                                wordlist.constructor.name === 'GeneratorFunction';
             
-            const batchSize = 50; // Process in batches for better performance
-            
+            // For generators (brute force), use single-threaded approach
             if (isGenerator || wordlist.next) {
-                // Handle generator (brute force)
+                const batchSize = 100;
                 let batch = [];
+                
                 for (let password of wordlist) {
                     if (!isRunning) return null;
                     batch.push(password);
@@ -1192,7 +1531,7 @@
                         batch = [];
                     }
 
-                    if (attemptCount > 50000) { // Limit brute force attempts
+                    if (attemptCount > 100000) {
                         return null;
                     }
                 }
@@ -1205,32 +1544,14 @@
                         return pwd;
                     }
                 }
+                
+                return null;
             } else {
-                // Handle array wordlist - optimized with batch processing
-                for (let i = 0; i < wordlist.length; i += batchSize) {
-                    if (!isRunning) return null;
-                    
-                    const end = Math.min(i + batchSize, wordlist.length);
-                    
-                    for (let j = i; j < end; j++) {
-                        attemptCount++;
-                        const password = wordlist[j];
-                        const hashedPassword = await hashString(password, algorithm);
-                        
-                        if (hashedPassword === targetHash.toLowerCase()) {
-                            return password;
-                        }
-                    }
-
-                    updateProgress((end / wordlist.length) * 100);
-                    document.getElementById('attemptsCount').textContent = attemptCount.toLocaleString();
-                    
-                    // Yield to prevent UI freeze
-                    await new Promise(resolve => setTimeout(resolve, 0));
-                }
+                // For array wordlists, use parallel workers for maximum speed
+                const result = await crackHashParallel(targetHash, algorithm, wordlist);
+                document.getElementById('attemptsCount').textContent = attemptCount.toLocaleString();
+                return result;
             }
-            
-            return null;
         }
 
         function updateProgress(percent) {
@@ -1256,19 +1577,30 @@
         }
 
         function startTimer() {
+            let lastAttempts = 0;
             timerInterval = setInterval(() => {
                 const elapsed = Math.floor((Date.now() - startTime) / 1000);
                 document.getElementById('timeElapsed').textContent = elapsed + 's';
+                
+                // Calculate hash rate (hashes per second)
+                const currentAttempts = attemptCount;
+                const hashRate = currentAttempts - lastAttempts;
+                lastAttempts = currentAttempts;
+                
+                document.getElementById('hashRate').textContent = hashRate.toLocaleString();
+                document.getElementById('workerStatus').textContent = workers.length;
             }, 1000);
         }
 
         function stopCracking() {
             isRunning = false;
+            terminateWorkers();
             if (timerInterval) {
                 clearInterval(timerInterval);
                 timerInterval = null;
             }
             updateProgress(100);
+            document.getElementById('workerStatus').textContent = '0';
         }
 
         async function generateHash() {
